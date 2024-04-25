@@ -1,0 +1,149 @@
+name: Create package
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    outputs:
+      package: ${{ steps.sdist.outputs.package }}
+
+    steps:
+    - name: Check out repo
+      uses: actions/checkout@v4
+
+    # https://cppbinder.readthedocs.io/en/latest/install.html#id1
+    - name: Install Ubuntu packages
+      run: |
+        sudo apt-get update
+        sudo apt-get install cmake make gcc g++ python3-dev python3-pip llvm-15 llvm-15-dev clang-15 libclang-15-dev pipx ninja-build
+        python3 -m pip install pybind11@git+https://github.com/pybind/pybind11.git@smart_holder
+
+    - name: Build binder
+      run: |
+        git clone https://github.com/RosettaCommons/binder.git
+        mkdir binder-build
+        cd binder-build
+        cmake -DLLVM_DIR=/usr/lib/llvm-15/lib/cmake/llvm -DClang_DIR=/usr/lib/llvm-15/lib/cmake/clang -Dpybind11_DIR=`python3 -c "import pybind11; print(pybind11.get_cmake_dir())"` ../binder
+        make
+        ctest
+        make install
+
+    - name: Build sdist
+      id: sdist
+      run: |
+        PYROL_VERSION=`date +%Y.%m.%d`
+
+        LLVM_PREFIX=/usr/lib/llvm-15
+        LLVM_VERSION=$(echo ${LLVM_PREFIX} | awk -F[\-\-] '{print $5}')
+        GCC_PREFIX=/usr/
+
+        git clone https://github.com/trilinos/Trilinos.git
+
+        cp ./Trilinos/packages/rol/pyrol/pyproject.toml ./Trilinos/pyproject.toml
+        sed -i "s/version = \"0.0.1\"/version = \"${PYROL_VERSION}\"/" ./Trilinos/pyproject.toml
+
+        mkdir build
+
+        ## Step 1: Use CMake to create a build directory.
+        cmake -G Ninja \
+        -D CMAKE_BUILD_TYPE:STRING=RELEASE \
+        -D Trilinos_ENABLE_CPACK_PACKAGING=ON \
+        -D Trilinos_CPACK_SOURCE_GENERATOR="TGZ" \
+        -D BUILD_SHARED_LIBS:BOOL=ON \
+        -D Trilinos_ENABLE_TESTS:BOOL=OFF \
+        -D Trilinos_ENABLE_EXAMPLES:BOOL=OFF \
+        -D Trilinos_ENABLE_Fortran:BOOL=OFF \
+        -D Trilinos_ENABLE_ALL_OPTIONAL_PACKAGES:BOOL=OFF \
+        -D Trilinos_ENABLE_ROL:BOOL=ON \
+        -D ROL_ENABLE_PYROL:BOOL=ON \
+        -D ROL_ENABLE_TESTS:BOOL=OFF \
+        -D ROL_ENABLE_EXAMPLES:BOOL=OFF \
+        -D PYROL_ENABLE_BINDER:BOOL=ON \
+        -D PYROL_ENABLE_BINDER_UPDATE:BOOL=ON \
+        -D PyROL_BINDER_clang_include_dirs:PATH="${LLVM_PREFIX}/include" \
+        -D PyROL_BINDER_LibClang_include_dir:PATH="${LLVM_PREFIX}/lib/clang/${LLVM_VERSION}/include" \
+        -D PyROL_BINDER_GCC_TOOLCHAIN:PATH="${GCC_PREFIX}" \
+        -D CPACK_SOURCE_IGNORE_FILES="/packages/rol/example;/packages/rol/test;/packages/rol/tutorial;/packages/teuchos/core/test;/packages/teuchos/core/example;/packages/teuchos/numerics/test;/packages/teuchos/numerics/example;/packages/teuchos/parameterlist/test;/packages/teuchos/parameterlist/example;/packages/teuchos/parser/test;/packages/teuchos/parser/example;/packages/teuchos/remainder/test;/packages/teuchos/remainder/example;/packages/teuchos/comm/test;/packages/teuchos/comm/example" \
+        -D CMAKE_INSTALL_PREFIX:PATH=install \
+        Trilinos -B./build
+
+        ## Step 2: Create the reduced tarball.
+        make package_source -C build
+
+        ## Step 3: Unpack the reduced tarball.
+        tar -zxf `find build -name "*-Source.tar.gz" -print -quit`
+        mv `find . -name "trilinos-*-Source" -print -quit` pyrol
+
+        ## Step 4: Create an SDist from the tarball.
+        python3 -m pipx run build --sdist pyrol
+        mv pyrol/dist/* .
+
+        PYROL_PACKAGE=`find . -name "pyrol-*.tar.gz" -print -quit`
+        echo "package=${PYROL_PACKAGE}"
+        echo "package=${PYROL_PACKAGE}" >> "$GITHUB_OUTPUT"
+
+    - name: Upload sdist as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: sdist
+        path: |
+          ${{steps.sdist.outputs.package}}
+
+  test:
+    needs: package
+    timeout-minutes: 30
+
+    strategy:
+      matrix:
+        include:
+          - os: 'ubuntu-latest'
+            py-version: '3.7'
+          - os: 'ubuntu-latest'
+            py-version: '3.8'
+          - os: 'ubuntu-latest'
+            py-version: '3.9'
+          - os: 'ubuntu-latest'
+            py-version: '3.10'
+          - os: 'ubuntu-latest'
+            py-version: '3.11'
+          - os: 'ubuntu-latest'
+            py-version: '3.12'
+          - os: 'macos-latest'
+            py-version: '3.11'
+          - os: 'windows-latest'
+            py-version: '3.11'
+      fail-fast: false
+
+    name: Test ${{ matrix.os }} Python ${{ matrix.py-version }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.py-version }}
+
+    - name: Download artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: sdist
+
+    - name: Install sdist (Ubuntu, MacOS)
+      if: (matrix.os == 'ubuntu-latest') || (matrix.os == 'macos-latest')
+      run: |
+        python3 -m venv venv
+        source venv/bin/activate
+        python3 -m pip install -vvv ${{needs.package.outputs.package}}
+
+    - name: Install sdist (Windows)
+      if: (matrix.os == 'windows-latest')
+      run: |
+        python3 -m venv venv
+        venv\Scripts\activate
+        python3 -m pip install -vvv ${{needs.package.outputs.package}}
